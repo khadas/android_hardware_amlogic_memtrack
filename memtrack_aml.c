@@ -21,10 +21,16 @@
 #include <string.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <inttypes.h>
+#include <dirent.h>
+#include <stdint.h>
 
 #include <hardware/memtrack.h>
 #include <log/log.h>
 
+#define DEBUG 0
+#define VMALLOCION "/proc/ion/vmalloc_ion"
+#define GPUT8X "/sys/kernel/debug/mali0/ctx"
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 
 static struct hw_module_methods_t memtrack_module_methods = {
@@ -66,7 +72,7 @@ static int memtrack_find_userid(int pid)
 
     sprintf(tmp, "/proc/%d/status", pid);
     if ((fp=fopen(tmp, "r")) == NULL) {
-        ALOGD("open file %s error %s", tmp, strerror(errno));
+        if (DEBUG) ALOGD("open file %s error %s", tmp, strerror(errno));
         return -1;
     }
 
@@ -88,7 +94,8 @@ static unsigned int memtrack_read_smaps(FILE *fp)
     unsigned int size, sum = 0;
     int skip, done = 0;
 
-    unsigned long int start, end;
+    uint64_t start;
+    uint64_t end = 0;
     int len;
     char *name;
     int nameLen, name_pos;
@@ -101,12 +108,12 @@ static unsigned int memtrack_read_smaps(FILE *fp)
         skip = 0;
 
         len = strlen(line);
-        if (len < 1) 
+        if (len < 1)
             return 0;
 
         line[--len] = 0;
 
-        if (sscanf(line, "%lx-%lx %*s %*x %*x:%*x %*d%n", &start, &end, &name_pos) != 2) {
+        if (sscanf(line, "%"SCNx64 "-%"SCNx64 " %*s %*x %*x:%*x %*d%n", &start, &end, &name_pos) != 2) {
             skip = 1;
         } else {
             while (isspace(line[name_pos])) {
@@ -115,13 +122,13 @@ static unsigned int memtrack_read_smaps(FILE *fp)
             name = line + name_pos;
             nameLen = strlen(name);
 
-            if (nameLen >= 8 && 
+            if (nameLen >= 8 &&
                     (!strncmp(name, "/dev/mali", 6) || !strncmp(name, "/dev/ump", 6))) {
                 skip = 0;
             } else {
                 skip = 1;
             }
-            
+
         }
 
         while (1) {
@@ -133,41 +140,87 @@ static unsigned int memtrack_read_smaps(FILE *fp)
             if(!skip) {
                 if (line[0] == 'S' && sscanf(line, "Size: %d kB", &size) == 1) {
                     sum += size;
-                } 
+                }
             }
-            
-            if (strlen(line) > 30 && line[8] == '-' && line[17] == ' ') {
+
+            if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %*s %*x %*x:%*x %*d", &start, &end) == 2) {
                 // looks like a new mapping
                 // example: "10000000-10001000 ---p 10000000 00:00 0"
                 break;
             }
         }
-
     }
 
     // converted into Bytes
     return (sum * 1024);
 }
 
+// mali t82x t83x
+static int memtrack_get_gpuT8X(char *path)
+{
+    FILE *file;
+    char line[1024];
+
+    int gpu_size = 0;
+
+    if ((file = fopen(path, "r")) == NULL) {
+        if (DEBUG) ALOGD("open file %s error %s", path, strerror(errno));
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+            if (sscanf(line, "Total allocated memory: %d", &gpu_size) != 1)
+                continue;
+            else
+                break;
+    }
+    fclose(file);
+    return gpu_size;
+}
+
 static unsigned int memtrack_get_gpuMem(int pid)
 {
     FILE *fp;
-    char tmp[128];
+    char *cp, tmp[128];
     unsigned int result;
 
-    sprintf(tmp, "/proc/%d/smaps", pid);
-    fp = fopen(tmp, "r");
-    if (fp == NULL) {
-        ALOGD("open file %s error %s", tmp, strerror(errno));
-        return 0;
-     }
+    DIR *gpudir;
+    struct dirent *dir;
+    int gpid = -1;
 
-    result = memtrack_read_smaps(fp);
+    gpudir = opendir(GPUT8X);
+    if (!gpudir) {
+        if (DEBUG)
+            ALOGD("open %s error %s\n", GPUT8X, strerror(errno));
+        sprintf(tmp, "/proc/%d/smaps", pid);
+        fp = fopen(tmp, "r");
+        if (fp == NULL) {
+            if (DEBUG) ALOGD("open file %s error %s", tmp, strerror(errno));
+            return 0;
+        }
+        result = memtrack_read_smaps(fp);
 
-    fclose(fp);
-    return result; 
+        fclose(fp);
+        return result;
+    } else {
+        while ((dir = readdir(gpudir))) {
+            strcpy(tmp, dir->d_name);
+            if ((cp=strchr(tmp, '_'))) {
+                *cp = '\0';
+                gpid = atoi(tmp);
+                if (gpid == pid) {
+                    sprintf(tmp, GPUT8X"/%s/%s", dir->d_name, "mem_profile");
+                    result = memtrack_get_gpuT8X(tmp);
+                    closedir(gpudir);
+                    return result;
+                }
+            }
+        }
+        closedir(gpudir);
+    }
+    return 0;
 }
-    
+
 static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
                              struct memtrack_record *records,
                              size_t *num_records)
@@ -202,15 +255,14 @@ static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
         if (ret <= 0) {
             return -1;
         }
-        gpu_size = memtrack_get_gpuMem(pid); 
+        gpu_size = memtrack_get_gpuMem(pid);
         unaccounted_size += gpu_size;
     } else if (type == MEMTRACK_TYPE_GRAPHICS) {
-        sprintf(tmp, "/proc/ion/vmalloc_ion"); 
-       // sprintf(tmp, "/sys/kernel/debug/ion/vmalloc_ion"); 
+        sprintf(tmp, VMALLOCION);
         if ((ion_fp = fopen(tmp, "r")) == NULL) {
-            ALOGD("open file %s error %s", tmp, strerror(errno));
+            if (DEBUG) ALOGD("open file %s error %s", tmp, strerror(errno));
             return -errno;
-        } 
+        }
 
         while(fgets(line, sizeof(line), ion_fp) != NULL) {
             if (sscanf(line, "%s%d%u", ion_name, &ion_pid, &ion_size) != 3) {
@@ -220,7 +272,7 @@ static int memtrack_get_memory(pid_t pid, enum memtrack_type type,
                     unaccounted_size += ion_size;
                 }
             }
-    
+
         }
 
         fclose(ion_fp);

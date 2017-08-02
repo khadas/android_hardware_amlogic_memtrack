@@ -286,12 +286,13 @@ int aml_memtrack_get_memory(const struct memtrack_module *module,
                                 struct memtrack_record *records,
                                 size_t *num_records)
 {
-    if (type == MEMTRACK_TYPE_GL || type == MEMTRACK_TYPE_GRAPHICS) {
-        return memtrack_get_memory(pid, type, records, num_records);
-
-    } else {
+    if (pid <= 0)
         return -EINVAL;
-    }
+
+    if (type == MEMTRACK_TYPE_GL || type == MEMTRACK_TYPE_GRAPHICS)
+        return memtrack_get_memory(pid, type, records, num_records);
+    else
+        return -ENODEV;
 }
 
 
